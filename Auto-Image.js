@@ -354,6 +354,11 @@ function applyTheme() {
       captchaFailed: "❌ Turnstile token generation failed. Trying fallback method...",
       automation: "Automation",
       noChargesThreshold: "⌛ Waiting for charges to reach {threshold}. Currently {current}. Next in {time}...",
+      repairModeStarting: "🛡️ Starting repair mode...",
+      repairScanning: "🔍 Scanning for damaged pixels...",
+      repairingPixels: "🔧 Repairing {count} incorrect pixels...",
+      repairScanComplete: "✅ Scan complete. No damage found.",
+      repairModeStopped: "🛑 Repair mode stopped.",
     },
     ru: {
       title: "WPlace Авто-Изображение",
@@ -1203,28 +1208,29 @@ function applyTheme() {
     initialSetupComplete: false, // Track if initial startup setup is complete (only happens once)
     overlayOpacity: CONFIG.OVERLAY.OPACITY_DEFAULT,
     blueMarbleEnabled: CONFIG.OVERLAY.BLUE_MARBLE_DEFAULT,
-  ditheringEnabled: true,
-  // Advanced color matching settings
-  colorMatchingAlgorithm: 'lab',
-  enableChromaPenalty: true,
-  chromaPenaltyWeight: 0.15,
-  customTransparencyThreshold: CONFIG.TRANSPARENCY_THRESHOLD,
-  customWhiteThreshold: CONFIG.WHITE_THRESHOLD,
-  resizeSettings: null,
-  originalImage: null,
-  resizeIgnoreMask: null,
-  // Notification prefs and runtime bookkeeping
-  notificationsEnabled: CONFIG.NOTIFICATIONS.ENABLED,
-  notifyOnChargesReached: CONFIG.NOTIFICATIONS.ON_CHARGES_REACHED,
-  notifyOnlyWhenUnfocused: CONFIG.NOTIFICATIONS.ONLY_WHEN_UNFOCUSED,
-  notificationIntervalMinutes: CONFIG.NOTIFICATIONS.REPEAT_MINUTES,
-  _lastChargesNotifyAt: 0,
-  _lastChargesBelow: true,
-  // Smart save tracking
-  _lastSavePixelCount: 0,
-  _lastSaveTime: 0,
-  _saveInProgress: false,
-  paintedMap: null,
+    ditheringEnabled: true,
+    // Advanced color matching settings
+    colorMatchingAlgorithm: 'lab',
+    enableChromaPenalty: true,
+    chromaPenaltyWeight: 0.15,
+    customTransparencyThreshold: CONFIG.TRANSPARENCY_THRESHOLD,
+    customWhiteThreshold: CONFIG.WHITE_THRESHOLD,
+    resizeSettings: null,
+    originalImage: null,
+    resizeIgnoreMask: null,
+    // Notification prefs and runtime bookkeeping
+    notificationsEnabled: CONFIG.NOTIFICATIONS.ENABLED,
+    notifyOnChargesReached: CONFIG.NOTIFICATIONS.ON_CHARGES_REACHED,
+    notifyOnlyWhenUnfocused: CONFIG.NOTIFICATIONS.ONLY_WHEN_UNFOCUSED,
+    notificationIntervalMinutes: CONFIG.NOTIFICATIONS.REPEAT_MINUTES,
+    _lastChargesNotifyAt: 0,
+    _lastChargesBelow: true,
+    // Smart save tracking
+    _lastSavePixelCount: 0,
+    _lastSaveTime: 0,
+    _saveInProgress: false,
+    paintedMap: null,
+    repairModeActive: false,
   }
 
   let _updateResizePreview = () => { };
@@ -3461,6 +3467,12 @@ function applyTheme() {
               </button>
             </div>
             <div class="wplace-row single">
+                <button id="repairBtn" class="wplace-btn wplace-btn-repair" disabled>
+                    <i class="fas fa-shield-alt"></i>
+                    <span>Start Repair</span>
+                </button>
+            </div>
+            <div class="wplace-row single">
                 <button id="toggleOverlayBtn" class="wplace-btn wplace-btn-overlay" disabled>
                     <i class="fas fa-eye"></i>
                     <span>${Utils.t("toggleOverlay")}</span>
@@ -4730,6 +4742,7 @@ function applyTheme() {
       const hasImageData = state.imageLoaded && state.imageData
       saveBtn.disabled = !hasImageData
       saveToFileBtn.disabled = !hasImageData
+      document.getElementById('repairBtn').disabled = !hasImageData;
     }
 
     updateDataButtons()
@@ -5739,6 +5752,146 @@ function applyTheme() {
       })
     }
 
+    function stopRepairMode() {
+  if (!state.repairModeActive) return;
+  state.repairModeActive = false;
+  
+  const repairBtn = document.getElementById('repairBtn');
+  const startBtn = document.getElementById('startBtn');
+  
+  if (repairBtn) {
+    repairBtn.innerHTML = `<i class="fas fa-shield-alt"></i> <span>Start Repair</span>`;
+    repairBtn.disabled = !state.imageLoaded;
+  }
+  if (startBtn) {
+    startBtn.disabled = !state.imageLoaded;
+  }
+
+  updateUI("repairModeStopped", "warning");
+  console.log("🛡️ Repair mode stopped by user.");
+}
+
+// Main function to start and run the repair mode
+async function startRepairMode() {
+    if (!state.imageLoaded || !state.startPosition || !state.region) {
+      Utils.showAlert("You must load an image and set a position to start repair mode.", "error");
+      return;
+    }
+    if (state.running) {
+      Utils.showAlert("Cannot start repair mode while painting is active.", "warning");
+      return;
+    }
+
+    state.repairModeActive = true;
+    const repairBtn = document.getElementById('repairBtn');
+    if (repairBtn) {
+      repairBtn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> <span>Stop Repair</span>`;
+    }
+    // Disable regular painting
+    const startBtn = document.getElementById('startBtn');
+    if (startBtn) startBtn.disabled = true;
+
+    console.log("🛡️ Repair mode started. Beginning initial scan...");
+
+    // Main repair loop
+    while (state.repairModeActive) {
+      updateUI("repairScanning", "default");
+      const pixelsToFix = new Map(); // Use a map to prevent duplicate pixels: "x,y,regionX,regionY" -> colorId
+
+      const { width, height, pixels: expectedPixels } = state.imageData;
+
+      // Scan the entire image area for discrepancies
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          if (!state.repairModeActive) break; // Exit scan if stopped
+
+          const expectedIdx = (y * width + x) * 4;
+          // Skip transparent pixels in the source image
+          if (expectedPixels[expectedIdx + 3] < CONFIG.TRANSPARENCY_THRESHOLD) {
+            continue;
+          }
+
+          const absX = state.startPosition.x + x;
+          const absY = state.startPosition.y + y;
+          const regionX = state.region.x + Math.floor(absX / 1000);
+          const regionY = state.region.y + Math.floor(absY / 1000);
+          const pixelX = absX % 1000;
+          const pixelY = absY % 1000;
+
+          // Get the color currently on the canvas
+          const currentColor = await overlayManager.getTilePixelColor(regionX, regionY, pixelX, pixelY);
+
+          // If pixel can't be read (e.g., tile not loaded), skip for now
+          if (!currentColor) continue;
+
+          // Determine expected color and current color IDs
+          const expectedColorId = findClosestColor([expectedPixels[expectedIdx], expectedPixels[expectedIdx + 1], expectedPixels[expectedIdx + 2]], state.availableColors);
+          const currentColorId = findClosestColor([currentColor[0], currentColor[1], currentColor[2]], state.availableColors);
+
+          // If they don't match, add to the fix queue
+          if (expectedColorId !== currentColorId) {
+            const key = `${pixelX},${pixelY},${regionX},${regionY}`;
+            pixelsToFix.set(key, { x: pixelX, y: pixelY, color: expectedColorId, regionX, regionY });
+          }
+        }
+        if (!state.repairModeActive) break;
+        // Yield to the browser to prevent freezing on large images
+        if (y % 20 === 0) await Utils.sleep(1);
+      }
+
+      // If pixels need fixing, process the queue
+      if (pixelsToFix.size > 0 && state.repairModeActive) {
+        console.log(`Found ${pixelsToFix.size} incorrect pixels to repair.`);
+        updateUI("repairingPixels", "default", { count: pixelsToFix.size });
+
+        const fixQueue = Array.from(pixelsToFix.values());
+
+        // Group pixels by region to create efficient batches
+        const batchesByRegion = fixQueue.reduce((acc, p) => {
+          const key = `${p.regionX},${p.regionY}`;
+          if (!acc[key]) acc[key] = { regionX: p.regionX, regionY: p.regionY, pixels: [] };
+          acc[key].pixels.push({ x: p.x, y: p.y, color: p.color });
+          return acc;
+        }, {});
+
+        for (const regionKey in batchesByRegion) {
+          if (!state.repairModeActive) break;
+
+          const batchData = batchesByRegion[regionKey];
+          const pixelsInBatch = batchData.pixels;
+          
+          // Wait for enough charges
+          while (state.currentCharges < pixelsInBatch.length && state.repairModeActive) {
+              updateUI("noCharges", "warning", { time: Utils.formatTime(state.cooldown) });
+              await updateStats();
+              await Utils.sleep(state.cooldown);
+          }
+          if (!state.repairModeActive) break;
+
+          // Send the repair batch
+          const success = await sendBatchWithRetry(pixelsInBatch, batchData.regionX, batchData.regionY);
+          if (success) {
+            state.currentCharges -= pixelsInBatch.length;
+            console.log(`Repaired ${pixelsInBatch.length} pixels in region ${regionKey}.`);
+            await updateStats();
+          } else {
+            console.error(`Failed to repair batch in region ${regionKey}. Will retry on next scan.`);
+          }
+        }
+      } else if (state.repairModeActive) {
+        updateUI("repairScanComplete", "success");
+      }
+
+      // Wait before the next full scan
+      if (state.repairModeActive) {
+        console.log("Scan complete. Waiting 30 seconds before next scan...");
+        await Utils.sleep(30000);
+      }
+    }
+    stopRepairMode(); // Ensure state is cleaned up
+  }
+
+
     async function startPainting() {
       if (!state.imageLoaded || !state.startPosition || !state.region) {
         updateUI("missingRequirements", "error")
@@ -5783,9 +5936,25 @@ function applyTheme() {
     }
 
     if (startBtn) {
-      startBtn.addEventListener("click", startPainting)
+      startBtn.addEventListener("click", () => {
+        if (state.repairModeActive) {
+          Utils.showAlert("Stop repair mode before starting to paint.", "warning");
+          return;
+        }
+        startPainting();
+      });
     }
 
+    const repairBtn = container.querySelector("#repairBtn");
+    if (repairBtn) {
+        repairBtn.addEventListener("click", () => {
+            if (state.repairModeActive) {
+                stopRepairMode();
+            } else {
+                startRepairMode();
+            }
+        });
+    }
     if (stopBtn) {
       stopBtn.addEventListener("click", () => {
         state.stopFlag = true
@@ -6552,4 +6721,4 @@ function applyTheme() {
       Utils.cleanupTurnstile();
     });
   })
-})()
+})();
